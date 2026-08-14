@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+#### 🚀 Updates
+
+- Ensures that Python is installed before setting up this toolchain.
+
 ## 0.1.1
 
 #### 🚀 Updates

@@ -1,11 +1,12 @@
 use crate::config::GoToolchainConfig;
-use crate::go_mod::{GoMod, Module, ModuleDependency, parse_go_mod};
+use crate::go_mod::parse_go_mod;
 use crate::go_sum::GoSum;
 use crate::go_work::GoWork;
+use crate::package_graph::{GoPackageGraph, is_version_segment};
 use extism_pdk::*;
-use moon_config::{BinEntry, DependencyScope};
+use moon_config::BinEntry;
 use moon_pdk::{
-    VirtualPathExt, command_exists, exec, get_host_env_var, get_host_environment, locate_root,
+    VirtualPathExt, command_exists, get_host_env_var, get_host_environment, locate_root,
     parse_toolchain_config_schema,
 };
 use moon_pdk_api::*;
@@ -13,160 +14,40 @@ use starbase_utils::fs;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-fn is_go_project(dir: &VirtualPath) -> bool {
-    dir.join("go.mod").exists()
-        || dir.join("go.sum").exists()
-        || dir.join("go.work").exists()
-        || dir.join("main.go").exists()
-}
-
-fn execute_go_list(
-    dir: &VirtualPath,
-    packages: &[String],
-    test: bool,
-) -> AnyResult<Vec<ModuleDependency>> {
-    let mut args = vec![
-        "list",
-        "-deps",
-        "-f",
-        "{{if .Module}}{{.Module.Path}}{{end}}",
-    ];
-
-    if test {
-        args.push("-test");
-    }
-
-    // Scan all packages recursively by default so that dependencies imported
-    // only from subdirectories (internal/, pkg/, ...) are also inferred.
-    if packages.is_empty() {
-        args.push("./...");
-    } else {
-        for package in packages {
-            args.push(package.as_str());
-        }
-    }
-
-    let result = exec(ExecCommandInput::pipe("go", args).cwd(dir.to_owned()))?;
-
-    if result.exit_code != 0 {
-        return Ok(vec![]);
-    }
-
-    Ok(result
-        .stdout
-        .lines()
-        .flat_map(|line| {
-            let line = line.trim();
-
-            if line.is_empty() {
-                None
-            } else {
-                Some(ModuleDependency {
-                    module: Module {
-                        module_path: line.into(),
-                        // This is a hack for our use case!
-                        version: if test {
-                            "internal-test".into()
-                        } else {
-                            "".into()
-                        },
-                    },
-                    indirect: false,
-                })
-            }
-        })
-        .collect())
-}
-
 #[plugin_fn]
 pub fn extend_project_graph(
     Json(input): Json<ExtendProjectGraphInput>,
 ) -> FnResult<Json<ExtendProjectGraphOutput>> {
-    let mut output = ExtendProjectGraphOutput::default();
     let config = parse_toolchain_config_schema::<GoToolchainConfig>(input.toolchain_config)?;
     let env = get_host_environment()?;
-    let go_exists = command_exists(env, "go");
 
-    // First pass, gather all packages and their manifests
-    let mut packages = BTreeMap::default();
+    let mut graph = GoPackageGraph::new(
+        input.context.workspace_root,
+        config,
+        command_exists(env, "go"),
+    );
 
-    for (id, source) in input.project_sources {
-        let project_root = input.context.workspace_root.join(source);
-        let go_mod_path = project_root.join("go.mod");
+    // First pass through, we figure out what projects we have and what their root import path is
+    graph.load_projects(input.project_sources)?;
 
-        let mut manifest = if go_mod_path.exists() {
-            output.input_files.push(go_mod_path.clone());
+    let mut output = ExtendProjectGraphOutput::default();
 
-            parse_go_mod(fs::read_file(&go_mod_path)?)?
-        } else {
-            GoMod {
-                // This name isn't correct, but we need something!
-                module: id.to_string(),
-                ..Default::default()
-            }
-        };
-
-        if go_exists && is_go_project(&project_root) {
-            if config.infer_relationships {
-                manifest.require.extend(execute_go_list(
-                    &project_root,
-                    &config.infer_relationships_packages,
-                    false,
-                )?);
-            }
-
-            if config.infer_relationships_from_tests {
-                manifest.require.extend(execute_go_list(
-                    &project_root,
-                    &config.infer_relationships_packages,
-                    true,
-                )?);
-            }
-        }
-
-        packages.insert(manifest.module.clone(), (id, manifest));
-    }
-
-    // Second pass, extract packages and their relationships
-    for (id, manifest) in packages.values() {
-        let mut project_output = ExtendProjectOutput {
-            alias: if manifest.module.is_empty() || manifest.module == id.as_str() {
-                None
-            } else {
-                Some(manifest.module.clone())
-            },
+    // On the second pass, we work through all the projects and resolve their dependencies
+    for project in graph.projects() {
+        let project_output = ExtendProjectOutput {
+            alias: project.alias.clone(),
+            dependencies: graph.project_dependencies(project)?,
             ..Default::default()
         };
 
-        for dep in &manifest.require {
-            let dep_module = &dep.module.module_path;
-
-            if !dep.indirect
-                && packages
-                    .get(dep_module)
-                    .is_some_and(|(dep_id, _)| dep_id != id)
-            {
-                project_output.dependencies.push(ProjectDependency {
-                    id: Id::raw(dep_module.clone()),
-                    scope: if dep.module.version == "internal-test" {
-                        DependencyScope::Development
-                    } else {
-                        DependencyScope::Production
-                    },
-                    via: Some(format!("module {}", dep_module)),
-                });
-            }
-        }
-
-        if project_output.alias.is_some()
-            || !project_output.dependencies.is_empty()
-            || !project_output.tasks.is_empty()
-        {
+        if project_output.alias.is_some() || !project_output.dependencies.is_empty() {
             output
                 .extended_projects
-                .insert(id.to_owned(), project_output);
+                .insert(project.id.to_owned(), project_output);
         }
     }
+
+    output.input_files = graph.into_input_files();
 
     Ok(Json(output))
 }
@@ -359,6 +240,29 @@ pub fn parse_manifest(
     Ok(Json(output))
 }
 
+fn is_bin_installed(
+    env: &HostEnvironment,
+    globals_dir: Option<&VirtualPath>,
+    module: &str,
+    version: &str,
+) -> bool {
+    // Without a registry to inspect (like Cargo's `.crates.toml`), we can't
+    // verify which version an installed binary is, so entries pinned to a
+    // version, branch, or commit are always included. Their command only
+    // executes when the environment fingerprint changes, like a version bump
+    if version != "latest" {
+        return false;
+    }
+
+    let Some(globals_dir) = globals_dir else {
+        return false;
+    };
+
+    globals_dir
+        .join(env.os.get_exe_name(get_bin_name(module)))
+        .exists()
+}
+
 #[plugin_fn]
 pub fn setup_environment(
     Json(input): Json<SetupEnvironmentInput>,
@@ -374,18 +278,23 @@ pub fn setup_environment(
         let mut bins_by_version = BTreeMap::default();
 
         for bin in &config.bins {
-            let name = match bin {
-                BinEntry::String(inner) => inner,
+            let (name, force) = match bin {
+                BinEntry::String(inner) => (inner.as_str(), false),
                 BinEntry::Object(cfg) => {
                     if cfg.local && env.ci {
                         continue;
-                    } else {
-                        cfg.bin.as_str()
                     }
+
+                    (cfg.bin.as_str(), cfg.force)
                 }
             };
 
             let (module, version) = name.split_once('@').unwrap_or((name, "latest"));
+
+            if !force && is_bin_installed(env, input.globals_dir.as_ref(), module, version) {
+                continue;
+            }
+
             let base_module = get_base_module(module);
 
             bins_by_version
@@ -441,4 +350,17 @@ fn get_base_module(module: &str) -> String {
     base.push_str(parts.next().unwrap_or_default());
 
     base
+}
+
+// The executable is named after the last segment of the module path,
+// excluding a major version suffix: `github.com/foo/bar/v2` -> `bar`
+fn get_bin_name(module: &str) -> &str {
+    let mut segments = module.rsplit('/');
+    let last = segments.next().unwrap_or(module);
+
+    if is_version_segment(last) {
+        return segments.next().unwrap_or(last);
+    }
+
+    last
 }

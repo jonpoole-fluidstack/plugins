@@ -42,21 +42,12 @@ mod go_toolchain_tier2 {
                         }
                     ),
                     (
+                        // `c` requires the sibling modules in its `go.mod`
+                        // but has no source importing them; a require without
+                        // a real import is not a relationship.
                         Id::raw("c"),
                         ExtendProjectOutput {
                             alias: Some("example.com/org/c".into()),
-                            dependencies: vec![
-                                ProjectDependency {
-                                    id: Id::raw("example.com/org/a"),
-                                    scope: DependencyScope::Production,
-                                    via: Some("module example.com/org/a".into()),
-                                },
-                                ProjectDependency {
-                                    id: Id::raw("example.com/org/b"),
-                                    scope: DependencyScope::Production,
-                                    via: Some("module example.com/org/b".into()),
-                                }
-                            ],
                             ..Default::default()
                         }
                     ),
@@ -116,6 +107,116 @@ mod go_toolchain_tier2 {
             assert!(output.input_files.is_empty());
         }
 
+        #[tokio::test(flavor = "multi_thread")]
+        async fn appends_major_version_folder_to_module() {
+            let sandbox = create_moon_sandbox("projects-versioned");
+            let plugin = sandbox.create_toolchain("go").await;
+
+            let mut input = ExtendProjectGraphInput::default();
+            input
+                .project_sources
+                .insert(Id::raw("consumer"), "consumer".into());
+            input.project_sources.insert(Id::raw("mod"), "mod".into());
+            input
+                .project_sources
+                .insert(Id::raw("mod-v2"), "mod/v2".into());
+            input
+                .project_sources
+                .insert(Id::raw("suffixed"), "suffixed/v3".into());
+
+            let output = plugin.extend_project_graph(input).await;
+
+            assert_eq!(
+                output.extended_projects,
+                BTreeMap::from_iter([
+                    (
+                        // `consumer` requires the versioned modules in its
+                        // `go.mod` but has no source importing them, so no
+                        // relationships are created; the version-suffixed
+                        // aliases below still resolve.
+                        Id::raw("consumer"),
+                        ExtendProjectOutput {
+                            alias: Some("example.com/org/consumer".into()),
+                            ..Default::default()
+                        }
+                    ),
+                    (
+                        Id::raw("mod"),
+                        ExtendProjectOutput {
+                            alias: Some("example.com/org/mod".into()),
+                            ..Default::default()
+                        }
+                    ),
+                    (
+                        Id::raw("mod-v2"),
+                        ExtendProjectOutput {
+                            alias: Some("example.com/org/mod/v2".into()),
+                            ..Default::default()
+                        }
+                    ),
+                    (
+                        Id::raw("suffixed"),
+                        ExtendProjectOutput {
+                            alias: Some("example.com/org/suffixed/v3".into()),
+                            ..Default::default()
+                        }
+                    ),
+                ])
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn resolves_deps_through_replace_directives() {
+            let sandbox = create_moon_sandbox("projects-versioned");
+            let plugin = sandbox.create_toolchain("go").await;
+
+            let mut input = ExtendProjectGraphInput::default();
+            input
+                .project_sources
+                .insert(Id::raw("arbitrary"), "arbitrary".into());
+            input.project_sources.insert(Id::raw("mod"), "mod".into());
+            input
+                .project_sources
+                .insert(Id::raw("replacer"), "replacer".into());
+
+            let output = plugin.extend_project_graph(input).await;
+
+            assert_eq!(
+                output.extended_projects,
+                BTreeMap::from_iter([
+                    (
+                        Id::raw("arbitrary"),
+                        ExtendProjectOutput {
+                            alias: Some("example.com/org/whatever".into()),
+                            ..Default::default()
+                        }
+                    ),
+                    (
+                        Id::raw("mod"),
+                        ExtendProjectOutput {
+                            alias: Some("example.com/org/mod".into()),
+                            ..Default::default()
+                        }
+                    ),
+                    (
+                        Id::raw("replacer"),
+                        ExtendProjectOutput {
+                            alias: Some("example.com/org/replacer".into()),
+                            // The `mod` require is replaced with an external
+                            // module, and `outside` escapes the workspace, so
+                            // neither creates a relationship
+                            dependencies: vec![ProjectDependency {
+                                id: Id::raw("arbitrary"),
+                                scope: DependencyScope::Production,
+                                via: Some("module example.com/org/renamed".into()),
+                            }],
+                            ..Default::default()
+                        }
+                    ),
+                ])
+            );
+        }
+
         mod go_list {
             use super::*;
 
@@ -157,14 +258,14 @@ mod go_toolchain_tier2 {
                                 alias: Some("example.com/org/c".into()),
                                 dependencies: vec![
                                     ProjectDependency {
-                                        id: Id::raw("example.com/org/a"),
+                                        id: Id::raw("a"),
                                         scope: DependencyScope::Production,
-                                        via: Some("module example.com/org/a".into()),
+                                        via: Some("package example.com/org/a".into()),
                                     },
                                     ProjectDependency {
-                                        id: Id::raw("example.com/org/b"),
+                                        id: Id::raw("b"),
                                         scope: DependencyScope::Production,
-                                        via: Some("module example.com/org/b".into()),
+                                        via: Some("package example.com/org/b".into()),
                                     }
                                 ],
                                 ..Default::default()
@@ -180,6 +281,127 @@ mod go_toolchain_tier2 {
                         VirtualPath::new("/workspace/b/go.mod"),
                         VirtualPath::new("/workspace/c/go.mod"),
                     ]
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn distinguishes_major_versioned_modules() {
+                let sandbox = create_moon_sandbox("projects-workspace-versioned");
+                let plugin = sandbox.create_toolchain("go").await;
+
+                let mut input = ExtendProjectGraphInput::default();
+                input
+                    .project_sources
+                    .insert(Id::raw("consumer"), "consumer".into());
+                input.project_sources.insert(Id::raw("mod"), "mod".into());
+                input
+                    .project_sources
+                    .insert(Id::raw("mod-v2"), "mod/v2".into());
+                input.toolchain_config = json!({
+                    "inferRelationships": true
+                });
+
+                let output = plugin.extend_project_graph(input).await;
+
+                // `example.com/org/mod` prefixes `example.com/org/mod/v2`, so
+                // the v2 import must resolve to the v2 project rather than
+                // collapsing into the v1 module.
+                assert_eq!(
+                    output.extended_projects.get(&Id::raw("consumer")),
+                    Some(&ExtendProjectOutput {
+                        alias: Some("example.com/org/consumer".into()),
+                        dependencies: vec![
+                            ProjectDependency {
+                                id: Id::raw("mod"),
+                                scope: DependencyScope::Production,
+                                via: Some("package example.com/org/mod".into()),
+                            },
+                            ProjectDependency {
+                                id: Id::raw("mod-v2"),
+                                scope: DependencyScope::Production,
+                                via: Some("package example.com/org/mod/v2".into()),
+                            },
+                        ],
+                        ..Default::default()
+                    })
+                );
+
+                assert_eq!(
+                    output.extended_projects.get(&Id::raw("mod-v2")),
+                    Some(&ExtendProjectOutput {
+                        alias: Some("example.com/org/mod/v2".into()),
+                        ..Default::default()
+                    })
+                );
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn infers_relations_within_a_single_module() {
+                let sandbox = create_moon_sandbox("projects-single-module");
+                let plugin = sandbox.create_toolchain("go").await;
+
+                let mut input = ExtendProjectGraphInput::default();
+                input.project_sources.insert(Id::raw("a"), "apps/a".into());
+                input.project_sources.insert(Id::raw("b"), "libs/b".into());
+                input.toolchain_config = json!({
+                    "inferRelationships": true
+                });
+
+                let output = plugin.extend_project_graph(input).await;
+
+                // Both projects derive their import path from the root go.mod,
+                // so only "a" has anything to output.
+                assert_eq!(
+                    output.extended_projects,
+                    BTreeMap::from_iter([(
+                        Id::raw("a"),
+                        ExtendProjectOutput {
+                            dependencies: vec![ProjectDependency {
+                                id: Id::raw("b"),
+                                scope: DependencyScope::Production,
+                                via: Some("package example.com/org/libs/b".into()),
+                            }],
+                            ..Default::default()
+                        }
+                    )])
+                );
+
+                assert_eq!(output.input_files, [VirtualPath::new("/workspace/go.mod")]);
+            }
+
+            #[tokio::test(flavor = "multi_thread")]
+            async fn doesnt_infer_edges_to_nested_projects_it_never_imports() {
+                let sandbox = create_moon_sandbox("projects-single-module");
+                let plugin = sandbox.create_toolchain("go").await;
+
+                let mut input = ExtendProjectGraphInput::default();
+                input.project_sources.insert(Id::raw("a"), "apps/a".into());
+                input.project_sources.insert(Id::raw("b"), "libs/b".into());
+                input
+                    .project_sources
+                    .insert(Id::raw("tool"), "apps/a/tool".into());
+                input.toolchain_config = json!({
+                    "inferRelationships": true
+                });
+
+                let output = plugin.extend_project_graph(input).await;
+
+                // `go list -deps ./...` run from `a` enumerates the nested
+                // `tool` project's package as a root even though nothing
+                // imports it; ownership must not become a dependency edge.
+                assert_eq!(
+                    output.extended_projects,
+                    BTreeMap::from_iter([(
+                        Id::raw("a"),
+                        ExtendProjectOutput {
+                            dependencies: vec![ProjectDependency {
+                                id: Id::raw("b"),
+                                scope: DependencyScope::Production,
+                                via: Some("package example.com/org/libs/b".into()),
+                            }],
+                            ..Default::default()
+                        }
+                    )])
                 );
             }
 
@@ -256,9 +478,9 @@ mod go_toolchain_tier2 {
                     Some(&ExtendProjectOutput {
                         alias: Some("example.com/org/d".into()),
                         dependencies: vec![ProjectDependency {
-                            id: Id::raw("example.com/org/a"),
+                            id: Id::raw("a"),
                             scope: DependencyScope::Production,
-                            via: Some("module example.com/org/a".into()),
+                            via: Some("package example.com/org/a".into()),
                         }],
                         ..Default::default()
                     })
@@ -279,18 +501,17 @@ mod go_toolchain_tier2 {
 
                 let output = plugin.extend_project_graph(input).await;
 
-                // `e` imports `example.com/org/a` only through the `a/pkg`
-                // subpackage, so the dependency is only inferred when
-                // `go list -deps` emits the owning module path via
-                // `-f {{if .Module}}{{.Module.Path}}{{end}}`.
+                // `e` never imports `example.com/org/a` itself, only the
+                // `a/pkg` subpackage, so the dependency relies on prefix
+                // matching rather than an exact import path match.
                 assert_eq!(
                     output.extended_projects.get(&Id::raw("e")),
                     Some(&ExtendProjectOutput {
                         alias: Some("example.com/org/e".into()),
                         dependencies: vec![ProjectDependency {
-                            id: Id::raw("example.com/org/a"),
+                            id: Id::raw("a"),
                             scope: DependencyScope::Production,
-                            via: Some("module example.com/org/a".into()),
+                            via: Some("package example.com/org/a/pkg".into()),
                         }],
                         ..Default::default()
                     })
@@ -936,6 +1157,150 @@ mod go_toolchain_tier2 {
                 .await;
 
             assert!(output.commands.is_empty());
+        }
+
+        // https://github.com/moonrepo/plugins/issues/137
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn only_installs_missing_bins() {
+            let sandbox = create_empty_moon_sandbox();
+            sandbox.create_file(".go/bin/gopls", "");
+            sandbox.create_file(".go/bin/gopls.exe", "");
+
+            let plugin = sandbox.create_toolchain("go").await;
+
+            let output = plugin
+                .setup_environment(SetupEnvironmentInput {
+                    root: VirtualPath::new(sandbox.path()),
+                    globals_dir: Some(VirtualPath::new(sandbox.path().join(".go/bin"))),
+                    toolchain_config: json!({
+                        "bins": ["golang.org/x/tools/gopls", "github.com/revel/cmd/revel"]
+                    }),
+                    ..Default::default()
+                })
+                .await;
+
+            assert_eq!(
+                output.commands,
+                [ExecCommand::new(
+                    ExecCommandInput::new("go", ["install", "-v", "github.com/revel/cmd/revel"],)
+                        .cwd(plugin.plugin.to_virtual_path(sandbox.path()))
+                )
+                .cache(CacheStrategy::Memory)
+                .label("go-bins-github.com/revel/cmd@latest")]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn adds_no_commands_if_all_bins_installed() {
+            let sandbox = create_empty_moon_sandbox();
+            sandbox.create_file(".go/bin/gopls", "");
+            sandbox.create_file(".go/bin/gopls.exe", "");
+
+            let plugin = sandbox.create_toolchain("go").await;
+
+            let output = plugin
+                .setup_environment(SetupEnvironmentInput {
+                    root: VirtualPath::new(sandbox.path()),
+                    globals_dir: Some(VirtualPath::new(sandbox.path().join(".go/bin"))),
+                    toolchain_config: json!({
+                        "bins": ["golang.org/x/tools/gopls"]
+                    }),
+                    ..Default::default()
+                })
+                .await;
+
+            assert!(output.commands.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn checks_exe_name_excluding_major_version_suffix() {
+            let sandbox = create_empty_moon_sandbox();
+            sandbox.create_file(".go/bin/revel", "");
+            sandbox.create_file(".go/bin/revel.exe", "");
+
+            let plugin = sandbox.create_toolchain("go").await;
+
+            let output = plugin
+                .setup_environment(SetupEnvironmentInput {
+                    root: VirtualPath::new(sandbox.path()),
+                    globals_dir: Some(VirtualPath::new(sandbox.path().join(".go/bin"))),
+                    toolchain_config: json!({
+                        "bins": ["github.com/revel/cmd/revel/v2"]
+                    }),
+                    ..Default::default()
+                })
+                .await;
+
+            assert!(output.commands.is_empty());
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn always_installs_versioned_bins() {
+            let sandbox = create_empty_moon_sandbox();
+            sandbox.create_file(".go/bin/gopls", "");
+            sandbox.create_file(".go/bin/gopls.exe", "");
+
+            let plugin = sandbox.create_toolchain("go").await;
+
+            let output = plugin
+                .setup_environment(SetupEnvironmentInput {
+                    root: VirtualPath::new(sandbox.path()),
+                    globals_dir: Some(VirtualPath::new(sandbox.path().join(".go/bin"))),
+                    toolchain_config: json!({
+                        "bins": ["golang.org/x/tools/gopls@v0.16.0"]
+                    }),
+                    ..Default::default()
+                })
+                .await;
+
+            assert_eq!(
+                output.commands,
+                [ExecCommand::new(
+                    ExecCommandInput::new(
+                        "go",
+                        ["install", "-v", "golang.org/x/tools/gopls@v0.16.0"],
+                    )
+                    .cwd(plugin.plugin.to_virtual_path(sandbox.path()))
+                )
+                .cache(CacheStrategy::Memory)
+                .label("go-bins-golang.org/x/tools@v0.16.0")]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn always_installs_forced_bins() {
+            let sandbox = create_empty_moon_sandbox();
+            sandbox.create_file(".go/bin/gopls", "");
+            sandbox.create_file(".go/bin/gopls.exe", "");
+
+            let plugin = sandbox.create_toolchain("go").await;
+
+            let output = plugin
+                .setup_environment(SetupEnvironmentInput {
+                    root: VirtualPath::new(sandbox.path()),
+                    globals_dir: Some(VirtualPath::new(sandbox.path().join(".go/bin"))),
+                    toolchain_config: json!({
+                        "bins": [
+                            {
+                                "bin": "golang.org/x/tools/gopls",
+                                "force": true
+                            }
+                        ]
+                    }),
+                    ..Default::default()
+                })
+                .await;
+
+            assert_eq!(
+                output.commands,
+                [ExecCommand::new(
+                    ExecCommandInput::new("go", ["install", "-v", "golang.org/x/tools/gopls"],)
+                        .cwd(plugin.plugin.to_virtual_path(sandbox.path()))
+                )
+                .cache(CacheStrategy::Memory)
+                .label("go-bins-golang.org/x/tools@latest")]
+            );
         }
     }
 }

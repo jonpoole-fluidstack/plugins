@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.0
+
+#### 🚀 Updates
+
+- Added unstable support for [Nub](https://nubjs.com/) as a package manager:
+  - Natively uses `nub.lock` (pnpm lockfile format), but will locate dependency
+    roots using other package manager lockfiles that nub can operate on.
+  - Reads workspace members and catalogs from `pnpm-workspace.yaml` when
+    present, otherwise from `package.json`.
+  - Does not require the Node.js toolchain, as nub is a standalone binary.
+
+#### 🐞 Fixes
+
+- Fixed `bun.lock` parsing failing on Git/GitHub dependencies that include both
+  package metadata (`dependencies`, `bin`, etc) and an integrity hash.
+
 ## 1.2.2
 
 #### 🚀 Updates
